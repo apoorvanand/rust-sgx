@@ -32,7 +32,7 @@ lazy_static! {
 }
 
 pub mod abi;
-mod interface;
+pub mod interface;
 
 use self::abi::dispatch;
 use self::interface::{Handler, OutputBuffer};
@@ -47,11 +47,11 @@ struct ReadOnly<R>(R);
 struct WriteOnly<W>(W);
 
 macro_rules! forward {
-	(fn $n:ident(&mut self $(, $p:ident : $t:ty)*) -> $ret:ty) => {
-		fn $n(&mut self $(, $p: $t)*) -> $ret {
-			self.0 .$n($($p),*)
-		}
-	}
+    (fn $n:ident(&mut self $(, $p:ident : $t:ty)*) -> $ret:ty) => {
+        fn $n(&mut self $(, $p: $t)*) -> $ret {
+            self.0 .$n($($p),*)
+        }
+    }
 }
 
 impl<R: Read> Read for ReadOnly<R> {
@@ -144,17 +144,23 @@ where
     }
 }
 
-trait SyncStream: 'static + Send + Sync {
-    fn read_alloc(&self, out: &mut OutputBuffer) -> IoResult<()> {
+pub trait SyncStream: 'static + Send + Sync {
+    fn read_alloc(&self) -> IoResult<Vec<u8>> {
         let mut buf = [0u8; 8192];
         let len = self.read(&mut buf)?;
-        out.set(&buf[..len]);
-        Ok(())
+        Ok(buf[..len].into())
     }
 
     fn read(&self, buf: &mut [u8]) -> IoResult<usize>;
     fn write(&self, buf: &[u8]) -> IoResult<usize>;
     fn flush(&self) -> IoResult<()>;
+}
+
+
+impl <T: SyncStream> From<T> for Box<SyncStream> {
+    fn from(value : T) -> Box<SyncStream> {
+        Box::new(value)
+    }
 }
 
 trait SyncListener: 'static + Send + Sync {
@@ -287,6 +293,7 @@ pub(crate) struct EnclaveState {
     fds: Mutex<FnvHashMap<Fd, Arc<FileDesc>>>,
     last_fd: AtomicUsize,
     exiting: AtomicBool,
+    usercall_ext: Box<UsercallExtension>,
 }
 
 impl EnclaveState {
@@ -310,26 +317,32 @@ impl EnclaveState {
     fn new(
         kind: EnclaveKind,
         event_queues: FnvHashMap<TcsAddress, Mutex<Sender<u8>>>,
-    ) -> Arc<Self> {
+        usercall_ext: Option<Box<UsercallExtension>>) -> Arc<Self> {
         let mut fds = FnvHashMap::default();
         fds.insert(FD_STDIN, Arc::new(FileDesc::stream(Shared(io::stdin()))));
         fds.insert(FD_STDOUT, Arc::new(FileDesc::stream(Shared(io::stdout()))));
         fds.insert(FD_STDERR, Arc::new(FileDesc::stream(Shared(io::stderr()))));
         let last_fd = AtomicUsize::new(fds.keys().cloned().max().unwrap() as _);
 
+        let usercall_ext = usercall_ext.unwrap_or_else( || {
+                                      let d = ConnectStreamDefault;
+                                      Box::new(d)
+                                  });
+
         Arc::new(EnclaveState {
             kind,
             event_queues,
             fds: Mutex::new(fds),
             last_fd,
-            exiting: AtomicBool::new(false)
+            exiting: AtomicBool::new(false),
+            usercall_ext : usercall_ext,
         })
     }
 
     pub(crate) fn main_entry(
         main: ErasedTcs,
         threads: Vec<ErasedTcs>,
-    ) -> StdResult<(), failure::Error> {
+        usercall_ext: Option<Box<UsercallExtension>>) -> StdResult<(), failure::Error>  {
         let mut event_queues =
             FnvHashMap::with_capacity_and_hasher(threads.len() + 1, Default::default());
         let main = Self::event_queue_add_tcs(&mut event_queues, main);
@@ -349,7 +362,7 @@ impl EnclaveState {
             wait_secondary_threads: Condvar::new(),
         });
 
-        let enclave = EnclaveState::new(kind, event_queues);
+        let enclave = EnclaveState::new(kind, event_queues, usercall_ext);
 
         let main_result = RunningTcs::entry(enclave.clone(), main, EnclaveEntry::ExecutableMain);
 
@@ -407,7 +420,8 @@ impl EnclaveState {
             })
     }
 
-    pub(crate) fn library(threads: Vec<ErasedTcs>) -> Arc<Self> {
+    pub(crate) fn library(threads: Vec<ErasedTcs>,
+                          usercall_ext: Option<Box<UsercallExtension>>) -> Arc<Self> {
         let mut event_queues =
             FnvHashMap::with_capacity_and_hasher(threads.len(), Default::default());
         let (send, recv) = channel();
@@ -422,7 +436,7 @@ impl EnclaveState {
             thread_sender: Mutex::new(send),
         });
 
-        EnclaveState::new(kind, event_queues)
+        EnclaveState::new(kind, event_queues, usercall_ext)
     }
 
     pub(crate) fn library_entry(
@@ -545,6 +559,28 @@ fn trap_attached_debugger(tcs: usize) {
     }
 }
 
+#[allow(unused)]
+pub trait UsercallExtension : 'static + Send + Sync + std::fmt::Debug {
+    fn connect_stream(
+        &self,
+        addr: &[u8],
+        local_addr: Option<&mut String>,
+        peer_addr: Option<&mut String>,
+    ) -> IoResult<Option<Box<SyncStream>>> {
+        Ok(None)
+    }
+}
+
+impl <T: UsercallExtension> From<T> for Box<UsercallExtension> {
+    fn from(value : T) -> Box<UsercallExtension> {
+        Box::new(value)
+    }
+}
+
+#[derive(Debug)]
+struct ConnectStreamDefault;
+impl UsercallExtension for ConnectStreamDefault{}
+
 #[allow(unused_variables)]
 impl RunningTcs {
     fn entry(
@@ -629,7 +665,9 @@ impl RunningTcs {
 
     #[inline(always)]
     fn read_alloc(&self, fd: Fd, buf: &mut OutputBuffer) -> IoResult<()> {
-        self.lookup_fd(fd)?.as_stream()?.read_alloc(buf)
+        let v = self.lookup_fd(fd)?.as_stream()?.read_alloc()?;
+        buf.set(v);
+        Ok(())
     }
 
     #[inline(always)]
@@ -681,21 +719,52 @@ impl RunningTcs {
         local_addr: Option<&mut OutputBuffer>,
         peer_addr: Option<&mut OutputBuffer>,
     ) -> IoResult<Fd> {
-        let addr = str::from_utf8(addr).map_err(|_| IoErrorKind::ConnectionRefused)?;
-        let stream = TcpStream::connect(addr)?;
-        if let Some(local_addr) = local_addr {
-            match stream.local_addr() {
-                Ok(local) => local_addr.set(local.to_string().into_bytes()),
-                Err(_) => local_addr.set(&b"error"[..]),
+        let mut l = String::new();
+        let mut p = String::new();
+        let o = 
+        {
+            let la = local_addr.as_ref().map(|_| &mut l);
+            let pa = peer_addr.as_ref().map(|_| &mut p);
+
+            self.enclave.usercall_ext.connect_stream(addr, la, pa)?
+        };
+
+        let stream = 
+        {
+            match o {
+                Some(s) => {
+                    s
+                }
+                None => {
+                    let addr = str::from_utf8(addr).map_err(|_| IoErrorKind::ConnectionRefused)?;
+                    let stream = TcpStream::connect(addr)?;
+                    if local_addr.is_some() {
+                        match stream.local_addr() {
+                            Ok(local) => l.push_str(&local.to_string()),
+                            Err(_) => l.push_str("error"),
+                        }
+                    }
+                    if peer_addr.is_some() {
+                        match stream.peer_addr() {
+                            Ok(peer) => p.push_str(&peer.to_string()),
+                            Err(_) => p.push_str("error"),
+                        }
+                   }
+                   Box::new(stream)
+                }
             }
+        };
+
+
+        if let Some(local_addr) = local_addr{
+            local_addr.set(l.into_bytes());
         }
-        if let Some(peer_addr) = peer_addr {
-            match stream.peer_addr() {
-                Ok(peer) => peer_addr.set(peer.to_string().into_bytes()),
-                Err(_) => peer_addr.set(&b"error"[..]),
-            }
+
+        if let Some(peer_addr) = peer_addr{
+            peer_addr.set(p.into_bytes());
         }
-        Ok(self.alloc_fd(FileDesc::stream(stream)))
+
+        Ok(self.alloc_fd(FileDesc::Stream(stream)))
     }
 
     #[inline(always)]
